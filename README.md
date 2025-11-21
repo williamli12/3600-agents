@@ -1,6 +1,7 @@
 Current Ranking of Bots:
 
-1. Billy (derivative of Bob and beats Henny less time than Bob, beats David 60-70% of time)
-2. Bob (beats Henny most of time, beats David 30% to 40% of time)
+
+1. Bob (beats Henny most of time, beats David 50-60% of time)
+2. Billy (so-so, should be an improvement of Bob but not working that well)
 3. Minimax (works)
 4. MCTSAgent (needs more fixing in order to work)
