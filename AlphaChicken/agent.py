@@ -13,8 +13,12 @@ import torch
 
 from game import board, enums
 
-from .model import AlphaChickenNet
-from .mcts import MCTS
+try:
+    from .model import AlphaChickenNet
+    from .mcts import MCTS
+except ImportError:
+    from model import AlphaChickenNet
+    from mcts import MCTS
 
 
 class TrapdoorBelief:
@@ -223,7 +227,7 @@ class PlayerAgent:
         
         # Allocate time: use a fraction of remaining time
         time_per_move = (remaining_time - self.time_safety_margin) / turns_remaining
-        time_budget = max(min(time_per_move * 0.8, 5.0), 0.1)  # Between 0.1 and 5 seconds
+        time_budget = max(min(time_per_move * 0.9, 8.0), 0.5)  # Between 0.5 and 8 seconds (increased thinking time)
         
         # Run MCTS
         start_time = time.time()
@@ -232,8 +236,8 @@ class PlayerAgent:
         
         root = None
         while time.time() - start_time < time_budget and simulations < max_simulations:
-            # Run one batch of simulations
-            batch_size = 10
+            # Run one batch of simulations (larger batches for better GPU utilization)
+            batch_size = 25
             root = self.mcts.search(board, num_simulations=batch_size)
             simulations += batch_size
             

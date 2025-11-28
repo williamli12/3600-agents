@@ -242,7 +242,7 @@ def main():
     games_per_epoch = 50
     num_simulations = 50
     batch_size = 256
-    learning_rate = 0.001
+    learning_rate = 0.0001  # Lower LR for stability (was 0.001)
     replay_buffer_size = 10000
     
     # Device
@@ -256,6 +256,11 @@ def main():
     
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    
+    # Learning rate scheduler (reduces LR when loss plateaus)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', patience=5, factor=0.5, verbose=True
+    )
     
     # Replay buffer
     replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
@@ -305,12 +310,17 @@ def main():
         
         epoch_time = time.time() - epoch_start
         
+        # Step the learning rate scheduler
+        scheduler.step(avg_total_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        
         # Log results
         print(f"\nEpoch {epoch + 1} Summary:")
         print(f"  Policy Loss: {avg_policy_loss:.4f}")
         print(f"  Value Loss:  {avg_value_loss:.4f}")
         print(f"  Total Loss:  {avg_total_loss:.4f}")
         print(f"  Time: {epoch_time:.1f}s")
+        print(f"  Current LR: {current_lr:.6f}")
         
         # Save checkpoint
         checkpoint_path = f'checkpoints/model_epoch_{epoch + 1}.pt'

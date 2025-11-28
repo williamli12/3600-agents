@@ -4,6 +4,7 @@ mcts.py - Monte Carlo Tree Search with UCT for AlphaChicken
 Implements MCTS with neural network evaluation and UCT selection.
 """
 
+import math
 import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional
@@ -149,7 +150,13 @@ class MCTS:
             
             # Convert to numpy
             policy_probs = torch.exp(policy_logits).cpu().numpy()[0]  # Shape: (12,)
-            value_estimate = value.cpu().numpy()[0, 0]  # Scalar
+            net_value = value.cpu().numpy()[0, 0]  # Scalar
+        
+        # Get heuristic value
+        heuristic_value = self._heuristic(node.board)
+        
+        # Mix neural network and heuristic (50/50 blend for stability)
+        value_estimate = 0.5 * net_value + 0.5 * heuristic_value
         
         # Mask invalid moves and renormalize
         valid_mask = get_valid_move_mask(node.board)
@@ -198,6 +205,41 @@ class MCTS:
             return -1.0
         else:  # TIE
             return 0.0
+    
+    def _heuristic(self, game_board: board.Board) -> float:
+        """
+        Hand-crafted heuristic for position evaluation.
+        Provides "common sense" to stabilize early training.
+        
+        Returns value in [-1, 1] from current player's perspective.
+        """
+        # Extract game state
+        my_eggs = game_board.chicken_player.get_eggs_laid()
+        enemy_eggs = game_board.chicken_enemy.get_eggs_laid()
+        my_turds_left = game_board.chicken_player.get_turds_left()
+        turn_count = game_board.turn_count
+        
+        # Get valid moves (mobility)
+        my_valid_moves = len(game_board.get_valid_moves(enemy=False))
+        enemy_valid_moves = len(game_board.get_valid_moves(enemy=True))
+        
+        # Start with egg difference (primary objective)
+        score = (my_eggs - enemy_eggs) * 10.0
+        
+        # Add mobility bonus
+        score += (my_valid_moves - enemy_valid_moves) * 2.0
+        
+        # Penalize early turd usage (preserve resources for mid/late game)
+        if turn_count < 20:
+            turds_used = 5 - my_turds_left
+            score -= turds_used * 5.0
+        
+        # Discourage egg dumping in opening (bad strategy)
+        if turn_count < 10:
+            score -= my_eggs * 2.0
+        
+        # Normalize to [-1, 1] using tanh
+        return math.tanh(score / 20.0)
     
     def _backpropagate(self, search_path: List[MCTSNode], value: float):
         """
