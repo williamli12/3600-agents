@@ -1,7 +1,10 @@
 """
 agent.py - Main agent interface for AlphaChicken
 
-This is the entry point called by the game engine.
+This agent uses a hybrid approach:
+1. Use the trained Neural Network (Policy Head) to rank moves by "expert intuition".
+2. Filter out obviously bad moves (invalid, walking into known trapdoors).
+3. (Optional future) Search top N moves. Currently just takes the best safe move.
 """
 
 import os
@@ -14,11 +17,9 @@ import torch
 from game import board, enums
 
 try:
-    from .model import AlphaChickenNet
-    from .mcts import MCTS
+    from .model import AlphaChickenNet, board_to_tensor, index_to_move, move_to_index
 except ImportError:
-    from model import AlphaChickenNet
-    from mcts import MCTS
+    from model import AlphaChickenNet, board_to_tensor, index_to_move, move_to_index
 
 
 class TrapdoorBelief:
@@ -146,17 +147,13 @@ class TrapdoorBelief:
 
 class PlayerAgent:
     """
-    AlphaChicken agent using deep RL and MCTS.
+    AlphaChicken agent using deep RL Policy Network directly.
+    Uses the network to propose moves, filters them for safety, and picks the best one.
     """
     
     def __init__(self, board: board.Board, time_left: Callable, seed: Optional[int] = None):
         """
         Initialize the agent.
-        
-        Args:
-            board: Initial game board
-            time_left: Function returning remaining time in seconds
-            seed: Random seed (optional)
         """
         # Set random seeds
         if seed is not None:
@@ -192,11 +189,6 @@ class PlayerAgent:
         # Initialize trapdoor belief tracker
         self.trap_belief = TrapdoorBelief(board_size=8)
         
-        # Initialize MCTS
-        self.mcts = MCTS(self.model, self.trap_belief, c_puct=1.5, device=self.device)
-        
-        # Time management
-        self.time_safety_margin = 2.0  # Reserve 2 seconds
         self.turn_count = 0
     
     def play(
@@ -206,69 +198,80 @@ class PlayerAgent:
         time_left: Callable,
     ) -> Tuple[enums.Direction, enums.MoveType]:
         """
-        Choose a move using MCTS.
-        
-        Args:
-            board: Current board state
-            sensor_data: Sensor readings [(heard, felt) for each trapdoor]
-            time_left: Function returning remaining time
-            
-        Returns:
-            (Direction, MoveType) tuple
+        Choose a move using Policy Network + Safety Checks.
         """
         self.turn_count += 1
         
         # Update trapdoor beliefs
         self.trap_belief.update(board, sensor_data)
         
-        # Calculate time budget
-        remaining_time = time_left()
-        turns_remaining = max(board.turns_left_player, 1)
-        
-        # Allocate time: use a fraction of remaining time
-        time_per_move = (remaining_time - self.time_safety_margin) / turns_remaining
-        time_budget = max(min(time_per_move * 0.9, 8.0), 0.5)  # Between 0.5 and 8 seconds (increased thinking time)
-        
-        # Run MCTS
-        start_time = time.time()
-        simulations = 0
-        max_simulations = 1000
-        
-        root = None
-        while time.time() - start_time < time_budget and simulations < max_simulations:
-            # Run one batch of simulations (larger batches for better GPU utilization)
-            batch_size = 25
-            root = self.mcts.search(board, num_simulations=batch_size)
-            simulations += batch_size
-            
-            # Early exit if very confident
-            if simulations >= 50:
-                best_move = self.mcts.get_best_move(root)
-                best_child = root.children.get(best_move)
-                if best_child and best_child.visit_count > simulations * 0.8:
-                    break  # One move dominates
-        
-        # Get best move
-        if root is None:
-            # Fallback: no time for search
-            valid_moves = board.get_valid_moves()
-            if valid_moves:
-                return valid_moves[0]
-            return (enums.Direction.UP, enums.MoveType.PLAIN)
-        
-        move = self.mcts.get_best_move(root)
-        
-        # Validate move
+        # Get valid moves
         valid_moves = board.get_valid_moves()
-        if move not in valid_moves:
-            # Fallback to valid move
-            if valid_moves:
-                move = valid_moves[0]
-            else:
-                move = (enums.Direction.UP, enums.MoveType.PLAIN)
+        if not valid_moves:
+            return (enums.Direction.UP, enums.MoveType.PLAIN) # Should not happen
+            
+        # 1. Safety Filter: Don't walk into known trapdoors
+        safe_moves = []
+        my_pos = board.chicken_player.get_location()
         
-        elapsed = time.time() - start_time
-        print(f"[AlphaChicken] Turn {self.turn_count}: {simulations} sims in {elapsed:.2f}s, move={move}")
+        for m in valid_moves:
+            # Predict next location
+            next_pos = board.chicken_player.get_next_loc(m[0], my_pos)
+            
+            # Check if it's a known trapdoor
+            if next_pos in board.found_trapdoors:
+                continue
+                
+            # Check probabilistic trapdoor risk
+            # Get risk from belief maps
+            if next_pos is not None:
+                x, y = next_pos
+                parity = (x + y) % 2
+                if parity == 0:
+                    risk = self.trap_belief.belief_even[y, x]
+                else:
+                    risk = self.trap_belief.belief_odd[y, x]
+                
+                # If risk is too high (> 50%), avoid unless desperate
+                if risk > 0.50:
+                    continue
+            
+            safe_moves.append(m)
+            
+        # If no safe moves, revert to all valid moves
+        moves_to_consider = safe_moves if safe_moves else valid_moves
         
-        return move
-
+        # 2. Neural Network Policy
+        # Prepare input tensor
+        state_tensor = board_to_tensor(board, self.trap_belief)
+        state_tensor = state_tensor.to(self.device)
+        
+        # Inference
+        with torch.no_grad():
+            policy_logits, value = self.model(state_tensor)
+            policy_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
+            
+        # 3. Pick Best Move from Candidates
+        best_move = None
+        best_score = -1.0
+        
+        for move in moves_to_consider:
+            # Convert move to index
+            idx = move_to_index(move[0], move[1])
+            
+            # Score is the network's probability for this move
+            score = policy_probs[idx]
+            
+            # Bonus: Prefer Egg moves slightly if score is close
+            if move[1] == enums.MoveType.EGG:
+                score *= 1.1
+            
+            if score > best_score:
+                best_score = score
+                best_move = move
+                
+        # Fallback
+        if best_move is None:
+            best_move = valid_moves[0]
+            
+        return best_move

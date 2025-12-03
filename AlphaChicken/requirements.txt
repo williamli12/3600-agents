@@ -6,8 +6,7 @@ torchvision>=0.15.0
 
 # Numerical Computing
 numpy>=1.24.0
+tqdm
 
 # Note: The 'game' module is provided by the assignment framework
 # and should be available in the parent directory
-
-

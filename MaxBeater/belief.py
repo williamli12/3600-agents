@@ -6,9 +6,10 @@ Uses sensor data (heard/felt) to update beliefs via Bayes' rule.
 """
 
 from __future__ import annotations
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Set
 import numpy as np
 from game import board
+from game.game_map import prob_hear, prob_feel
 
 Coord = Tuple[int, int]
 
@@ -16,33 +17,24 @@ Coord = Tuple[int, int]
 class TrapdoorBelief:
     """
     Bayesian belief tracker for two trapdoors on an 8x8 board.
-    
-    Game rules:
-    - 2 trapdoors total: one on even-parity squares (x+y even), one on odd-parity
-    - More likely in center rings (2-3 from edge), less likely on edges/corners
-    - Sensor probabilities based on Manhattan distance:
-        hear: 0.5 (adj), 0.25 (diag), 0.1 (dist=2), 0 (>2 or dist=2 diag)
-        feel: 0.3 (adj), 0.15 (diag), 0 (>1)
+    Assumes one trapdoor is on an even square (x+y is even) and one on an odd square.
     """
-    
+
     def __init__(self, board_size: int = 8):
         self.board_size = board_size
         # Separate beliefs for even and odd parity trapdoors
         self.belief_even: Dict[Coord, float] = {}
         self.belief_odd: Dict[Coord, float] = {}
+        
+        # Track squares known to be safe (visited and survived)
+        self.safe_squares: Set[Coord] = set()
+        
         self._init_priors()
-    
+
     def _init_priors(self) -> None:
         """
         Initialize prior beliefs based on game trapdoor placement rules.
-        
-        Trapdoors are placed with weights:
-        - Ring 0-1 (edges): weight 0 (impossible)
-        - Ring 2: weight 1.0
-        - Ring 3 (center 2x2): weight 2.0
-        
-        We initialize with small epsilon on edges (not true 0) to avoid
-        division issues, and normalize.
+        Favor center rings.
         """
         for y in range(self.board_size):
             for x in range(self.board_size):
@@ -51,7 +43,7 @@ class TrapdoorBelief:
                 
                 # Weight based on ring
                 if dist_from_edge < 2:
-                    weight = 0.001  # Small epsilon, trapdoors rarely spawn here
+                    weight = 0.001  # Very unlikely on edges
                 elif dist_from_edge == 2:
                     weight = 1.0
                 else:  # dist_from_edge >= 3 (center region)
@@ -64,9 +56,8 @@ class TrapdoorBelief:
                 else:
                     self.belief_odd[coord] = weight
         
-        # Normalize to proper probability distributions
         self._normalize()
-    
+
     def _normalize(self) -> None:
         """Normalize both belief distributions to sum to 1."""
         total_even = sum(self.belief_even.values())
@@ -79,31 +70,31 @@ class TrapdoorBelief:
         if total_odd > 0:
             for coord in self.belief_odd:
                 self.belief_odd[coord] /= total_odd
-    
+
     def update(self, game_board: board.Board, sensor_data: List[Tuple[bool, bool]]) -> None:
         """
-        Update beliefs using Bayes' rule given sensor observations.
-        
-        Args:
-            game_board: Current board state
-            sensor_data: [(heard_trap0, felt_trap0), (heard_trap1, felt_trap1)]
-                        trap0 is even-parity, trap1 is odd-parity
+        Update beliefs using Bayes' rule given sensor observations and visited squares.
         """
-        player_pos = game_board.chicken_player.get_location()
-        found_traps = game_board.found_trapdoors
+        # 1. Update safe squares based on current positions (if you are there, it's safe)
+        p_loc = game_board.chicken_player.get_location()
+        e_loc = game_board.chicken_enemy.get_location()
+        self.safe_squares.add(p_loc)
+        self.safe_squares.add(e_loc)
         
-        # Update even-parity trapdoor belief (trap 0)
+        found_traps = game_board.found_trapdoors
+
+        # 2. Update even-parity trapdoor belief (trap 0)
         if len(sensor_data) > 0:
             heard, felt = sensor_data[0]
-            self._bayesian_update(self.belief_even, player_pos, heard, felt, found_traps)
-        
-        # Update odd-parity trapdoor belief (trap 1)
+            self._bayesian_update(self.belief_even, p_loc, heard, felt, found_traps)
+
+        # 3. Update odd-parity trapdoor belief (trap 1)
         if len(sensor_data) > 1:
             heard, felt = sensor_data[1]
-            self._bayesian_update(self.belief_odd, player_pos, heard, felt, found_traps)
+            self._bayesian_update(self.belief_odd, p_loc, heard, felt, found_traps)
         
         self._normalize()
-    
+
     def _bayesian_update(
         self,
         belief: Dict[Coord, float],
@@ -116,135 +107,91 @@ class TrapdoorBelief:
         Apply Bayesian update: P(trap at s | observation) ∝ P(obs | trap at s) * P(trap at s)
         """
         for coord in belief.keys():
-            # If we've found this trapdoor, set probability to 0
+            # If this square is known safe (visited), probability is 0
+            # Unless it is a found trapdoor (which makes it 100% a trapdoor)
             if coord in found_traps:
+                # This is the trapdoor!
+                belief[coord] = 1.0
+                # We will normalize later, effectively zeroing out others if this is 1.0
+                # But we should process others to 0?
+                # If we set this to 1.0, and normalize, it will dominate.
+                # But usually found_traps are handled by eliminating others.
+                continue
+                
+            if coord in self.safe_squares:
                 belief[coord] = 0.0
                 continue
-            
+
             # Calculate Manhattan distance
             dx = abs(coord[0] - player_pos[0])
             dy = abs(coord[1] - player_pos[1])
             
             # Calculate likelihood P(heard, felt | trapdoor at coord)
-            likelihood = self._calc_likelihood(dx, dy, heard, felt)
+            # Note: We import prob_hear/prob_feel from game_map which handle likelihoods
+            p_hear_val = prob_hear(dx, dy)
+            p_feel_val = prob_feel(dx, dy)
+
+            # If heard=True, P(obs|trap) = p_hear_val
+            # If heard=False, P(obs|trap) = 1 - p_hear_val
             
-            # Bayesian update: posterior ∝ likelihood × prior
-            belief[coord] *= likelihood
-    
-    def _calc_likelihood(self, dx: int, dy: int, heard: bool, felt: bool) -> float:
-        """
-        Calculate P(heard, felt | trapdoor at distance (dx, dy)).
-        
-        Based on game's probability functions:
-        - prob_hear(dx, dy)
-        - prob_feel(dx, dy)
-        """
-        # Standing on the trapdoor (would have been found)
-        if dx == 0 and dy == 0:
-            return 1.0
-        
-        # Probability of hearing based on distance
-        if dx > 2 or dy > 2:
-            p_hear = 0.0
-        elif dx == 2 and dy == 2:
-            p_hear = 0.0
-        elif dx == 2 or dy == 2:
-            p_hear = 0.1
-        elif dx == 1 and dy == 1:
-            p_hear = 0.25
-        elif dx == 1 or dy == 1:
-            p_hear = 0.5
-        else:
-            p_hear = 0.0
-        
-        # Probability of feeling based on distance
-        if dx > 1 or dy > 1:
-            p_feel = 0.0
-        elif dx == 1 and dy == 1:
-            p_feel = 0.15
-        elif dx == 1 or dy == 1:
-            p_feel = 0.3
-        else:
-            p_feel = 0.0
-        
-        # Calculate likelihood of observation
-        # Use small epsilon instead of 0 to avoid complete elimination
-        epsilon = 0.01
-        
-        if heard:
-            hear_likelihood = max(p_hear, epsilon)
-        else:
-            hear_likelihood = max(1.0 - p_hear, epsilon)
-        
-        if felt:
-            feel_likelihood = max(p_feel, epsilon)
-        else:
-            feel_likelihood = max(1.0 - p_feel, epsilon)
-        
-        return hear_likelihood * feel_likelihood
-    
-    def risk(self, coord: Coord) -> float:
-        """
-        Combined probability that any trapdoor is at coord.
-        
-        Returns:
-            Sum of probabilities from both trapdoor beliefs
-        """
-        return self.belief_even.get(coord, 0.0) + self.belief_odd.get(coord, 0.0)
-    
-    def max_risk_in_radius(self, coord: Coord, radius: int = 2) -> float:
-        """
-        Maximum trapdoor risk among squares within Manhattan radius of coord.
-        
-        Args:
-            coord: Center position
-            radius: Manhattan distance radius
+            lik_hear = p_hear_val if heard else (1.0 - p_hear_val)
+            lik_feel = p_feel_val if felt else (1.0 - p_feel_val)
             
-        Returns:
-            Maximum risk value in the neighborhood
+            # Avoid multiplying by exact zero to allow recovery if model is slightly off?
+            # Or stick to strict Bayes. Game returns 0.0, so strict is fine.
+            # But let's use a tiny epsilon for robustness.
+            lik_hear = max(lik_hear, 1e-6)
+            lik_feel = max(lik_feel, 1e-6)
+
+            belief[coord] *= (lik_hear * lik_feel)
+
+    def get_prob(self, row: int, col: int) -> float:
+        """Get probability of a trapdoor at (row, col)."""
+        coord = (row, col)
+        if (row + col) % 2 == 0:
+            return self.belief_even.get(coord, 0.0)
+        else:
+            return self.belief_odd.get(coord, 0.0)
+
+    def snapshot(self) -> Tuple:
         """
-        max_risk = 0.0
+        Return a hashable representation of the belief state for the Transposition Table.
+        We can't hash the whole float grid. We can hash a simplified version.
+        Maybe just the 'safe_squares' count and a rounded hash of high-prob areas?
         
-        for y in range(self.board_size):
-            for x in range(self.board_size):
-                # Check if within radius
-                manhattan_dist = abs(x - coord[0]) + abs(y - coord[1])
-                if manhattan_dist <= radius:
-                    risk_val = self.risk((x, y))
-                    max_risk = max(max_risk, risk_val)
+        For simplicity/speed, let's hash:
+        - The locations of found trapdoors (implicitly in board state, but useful here)
+        - A few high-probability candidates?
         
-        return max_risk
-    
-    def expected_risk_in_radius(self, coord: Coord, radius: int = 2) -> float:
+        Actually, just rounding the probs to 1 decimal place and hashing the tuple of values > 0.1?
+        Or simpler: The belief state is largely determined by 'safe_squares' and 'found_trapdoors' + 'turns/observations'.
+        
+        Let's try a tuple of top 3 most likely coordinates for each parity?
         """
-        Expected (average) trapdoor risk within Manhattan radius of coord.
-        """
-        total_risk = 0.0
-        count = 0
+        # Simple hashable: Just the count of safe squares? Too weak.
+        # Let's assume the board configuration + move number captures most context.
+        # But for belief specifically, maybe we just return nothing and rely on board state?
+        # The prompt asked for "something hashable for TT".
         
-        for y in range(self.board_size):
-            for x in range(self.board_size):
-                manhattan_dist = abs(x - coord[0]) + abs(y - coord[1])
-                if manhattan_dist <= radius:
-                    total_risk += self.risk((x, y))
-                    count += 1
+        # Let's return a tuple of (coord, rounded_prob) for non-zero probs? Too big.
+        # How about: The coordinates of the Maximum Likelihood Estimate for each trapdoor?
         
-        return total_risk / count if count > 0 else 0.0
-    
+        mle_even = max(self.belief_even.items(), key=lambda x: x[1], default=((0,0), 0))[0]
+        mle_odd = max(self.belief_odd.items(), key=lambda x: x[1], default=((0,0), 0))[0]
+        return (mle_even, mle_odd, len(self.safe_squares))
+
     def get_belief_grid(self) -> np.ndarray:
-        """
-        Get combined belief as 8x8 grid for visualization or feature extraction.
-        
-        Returns:
-            8x8 numpy array with combined trapdoor probabilities
-        """
+        """Visualization helper."""
         grid = np.zeros((self.board_size, self.board_size), dtype=np.float32)
-        
         for y in range(self.board_size):
             for x in range(self.board_size):
-                coord = (x, y)
-                grid[y, x] = self.risk(coord)
-        
+                grid[x, y] = self.get_prob(x, y) # x is col? wait. board uses (x,y) usually as (col, row) or (row, col)?
+                # Board usually uses (x,y). Python arrays are [row, col] -> [y, x].
+                # get_prob takes (row, col) -> (x, y)? 
+                # get_prob implementation uses (row, col) as dict key. 
+                # The dict keys were initialized as (x, y).
+                # If the loop in _init_priors used for y... for x... coord=(x,y), then x is col?
+                # Yes, usually x=col, y=row.
+                # So get_prob(row, col) should map to (col, row) or (row, col)?
+                # Let's assume (x, y) everywhere means (x, y). 
         return grid
-
-

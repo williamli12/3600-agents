@@ -1,269 +1,208 @@
 """
-evaluator.py - Board evaluation combining heuristics and learned value function
-
-Provides comprehensive evaluation from current player's perspective.
-Combines hand-crafted heuristics with optional neural network value estimation.
+evaluator.py - Board evaluation for MaxBeater (Minimax version)
 """
 
 from __future__ import annotations
-from typing import Optional
+from typing import Dict, Tuple, Optional
+from collections import deque
 import numpy as np
 from game import board, enums
 from .belief import TrapdoorBelief
-from .features import extract_scalar_features, encode_board_tensor
-from .value_model_runtime import ValueModelRuntime
 
+Coord = Tuple[int, int]
 
 class Evaluator:
     """
-    Evaluates board states from the current player's perspective.
-    
-    Combines:
-    1. Hand-crafted heuristic (always available)
-    2. Learned value function (if weights available)
-    
-    The heuristic focuses on:
-    - Egg differential (primary objective)
-    - Mobility and blocking
-    - Strategic positioning (corners, center)
-    - Trapdoor risk management
-    - Turd resource management
+    Evaluator class that provides heuristic evaluation for the Minimax search.
     """
     
     def __init__(self, trap_belief: TrapdoorBelief):
+        self.trap_belief = trap_belief
+        
+        # Weights
+        self.w_eggs = 50.0
+        self.w_space = 5.0
+        self.w_trap = 20.0
+        self.w_revisit = 2.0
+        self.w_turds = 5.0
+        self.w_mobility = 1.0
+
+    def evaluate_state(
+        self, 
+        game_board: board.Board, 
+        belief: TrapdoorBelief, 
+        visit_counts: Dict[Coord, int]
+    ) -> float:
         """
-        Initialize evaluator.
+        Heuristic evaluation of the board state.
         
         Args:
-            trap_belief: Trapdoor belief tracker (shared with agent)
-        """
-        self.trap_belief = trap_belief
-        self.value_model = ValueModelRuntime()
-        
-        # Heuristic weights (tuned for importance)
-        self.weights = {
-            'egg_diff': 1000.0,          # Most important: egg differential
-            'corner_egg_bonus': 200.0,   # Corners give 3x eggs
-            'mobility': 15.0,            # Having more valid moves
-            'blocking_bonus': 500.0,     # Blocking enemy completely
-            'blocked_penalty': 500.0,    # Being blocked is very bad
-            'trap_risk_current': 150.0,  # Risk at current position
-            'trap_risk_nearby': 50.0,    # Risk in neighborhood
-            'turd_diff': 30.0,           # Turd resource advantage
-            'center_control': 10.0,      # Central positioning
-            'endgame_egg_mult': 1.5,     # Multiply egg importance in endgame
-        }
-    
-    def heuristic(self, game_board: board.Board) -> float:
-        """
-        Hand-crafted heuristic evaluation.
+            game_board: The current board state (perspective of 'chicken_player').
+            belief: The current trapdoor belief state.
+            visit_counts: Dictionary mapping coordinates to visit counts for the current search path.
         
         Returns:
-            Score from current player's perspective (higher = better)
+            Float score (higher is better for chicken_player).
         """
-        # Check for terminal states first
+        # Terminal state check
         if game_board.is_game_over():
-            return self._terminal_value(game_board)
+            winner = game_board.get_winner()
+            if winner == enums.Result.PLAYER:
+                return 100000.0
+            elif winner == enums.Result.ENEMY:
+                return -100000.0
+            else:
+                return 0.0
         
         score = 0.0
         
-        # === PRIMARY: Egg differential ===
+        # 1. Egg Count Difference
         my_eggs = game_board.chicken_player.get_eggs_laid()
-        enemy_eggs = game_board.chicken_enemy.get_eggs_laid()
-        egg_diff = my_eggs - enemy_eggs
-        
-        # Increase egg importance in endgame
-        turns_left = game_board.turns_left_player
-        if turns_left < 10:
-            egg_weight = self.weights['egg_diff'] * self.weights['endgame_egg_mult']
-        else:
-            egg_weight = self.weights['egg_diff']
-        
-        score += egg_diff * egg_weight
-        
-        # === MOBILITY: Valid moves ===
-        my_moves = game_board.get_valid_moves(enemy=False)
-        num_my_moves = len(my_moves)
-        
-        # Create enemy perspective board to check their mobility
-        enemy_board = game_board.get_copy()
-        enemy_board.reverse_perspective()
-        enemy_moves = enemy_board.get_valid_moves(enemy=False)
-        num_enemy_moves = len(enemy_moves)
-        
-        # Being blocked is catastrophic (enemy gets +5 eggs)
-        if num_my_moves == 0:
-            score -= self.weights['blocked_penalty']
-        else:
-            score += num_my_moves * self.weights['mobility']
-        
-        # Blocking enemy is excellent (we get +5 eggs)
-        if num_enemy_moves == 0:
-            score += self.weights['blocking_bonus']
-        else:
-            score -= num_enemy_moves * self.weights['mobility']
-        
-        # === STRATEGIC POSITIONING ===
+        opp_eggs = game_board.chicken_enemy.get_eggs_laid()
+        eggs_diff = my_eggs - opp_eggs
+        score += self.w_eggs * eggs_diff
+
+        # 2. Trapdoor Risk
+        # Penalize standing on high risk
         my_pos = game_board.chicken_player.get_location()
-        enemy_pos = game_board.chicken_enemy.get_location()
+        opp_pos = game_board.chicken_enemy.get_location()
         
-        # Corner bonus: corners give 3 eggs instead of 1
-        corners = [
-            (0, 0),
-            (0, game_board.game_map.MAP_SIZE - 1),
-            (game_board.game_map.MAP_SIZE - 1, 0),
-            (game_board.game_map.MAP_SIZE - 1, game_board.game_map.MAP_SIZE - 1)
-        ]
+        my_risk = belief.risk(my_pos) if hasattr(belief, 'risk') else (belief.get_prob(*my_pos) if hasattr(belief, 'get_prob') else 0)
+        # Adapt to whatever belief API we settled on. belief.py has get_prob(row, col).
+        # I added get_prob. I didn't add risk() in my rewrite? 
+        # Ah, I missed adding `risk()` wrapper in belief.py. 
+        # `get_prob` handles parity internally so it is effectively the risk (since other parity is 0).
+        my_risk = belief.get_prob(my_pos[1], my_pos[0]) # Board uses (x,y) = (col, row). get_prob uses (row, col)?
+        # Let's check belief.py again. 
+        # In belief.py: get_prob(row, col).
+        # Board loc is (x, y).
+        # Usually x=col, y=row.
+        # So call belief.get_prob(my_pos[1], my_pos[0]).
         
-        if my_pos in corners and game_board.can_lay_egg():
-            score += self.weights['corner_egg_bonus']
+        # Actually, let's just look at belief.py again to be sure about coordinate system.
+        # belief.py: `coord = (x, y)`. `get_prob(row, col)` -> `coord=(row, col)`.
+        # If `_init_priors` uses `x` and `y` and `coord=(x,y)`, then `get_prob` should take `x, y`.
+        # My rewrite of belief.py: `get_prob(row, col) -> coord=(row, col)`.
+        # The user prompt implies standard matrix indexing for belief?
+        # "get_prob(self, row, col) -> float".
+        # Game uses (x, y).
+        # I will assume x=col, y=row.
         
-        if enemy_pos in corners and enemy_board.can_lay_egg():
-            score -= self.weights['corner_egg_bonus']
+        my_risk = belief.get_prob(my_pos[1], my_pos[0]) 
+        score -= self.w_trap * my_risk * 10.0 # Heavy penalty for standing on trap
+
+        # Reward if opponent is on risk
+        opp_risk = belief.get_prob(opp_pos[1], opp_pos[0])
+        score += self.w_trap * opp_risk * 5.0
+
+        # Neighborhood risk?
+        # Penalize moving into high risk areas
         
-        # Center control (more strategic in midgame)
-        center = game_board.game_map.MAP_SIZE / 2.0
-        my_dist_center = abs(my_pos[0] - center) + abs(my_pos[1] - center)
-        enemy_dist_center = abs(enemy_pos[0] - center) + abs(enemy_pos[1] - center)
+        # 3. BFS Reachable Space
+        # Estimate additional eggs we can lay
+        my_space = self.bfs_reachable_eggs(game_board, my_pos, game_board.turns_left_player, belief, game_board.chicken_player, is_opponent=False)
         
-        # Prefer center early/mid game
-        if turns_left > 15:
-            score += (enemy_dist_center - my_dist_center) * self.weights['center_control']
+        # Estimate for opponent
+        # We need their turns left. game_board has turns_left_enemy.
+        opp_space = self.bfs_reachable_eggs(game_board, opp_pos, game_board.turns_left_enemy, belief, game_board.chicken_enemy, is_opponent=True)
         
-        # === TRAPDOOR RISK MANAGEMENT ===
-        my_risk = self.trap_belief.risk(my_pos)
-        my_nearby_risk = self.trap_belief.max_risk_in_radius(my_pos, radius=2)
-        
-        score -= my_risk * self.weights['trap_risk_current']
-        score -= my_nearby_risk * self.weights['trap_risk_nearby']
-        
-        # Enemy trap risk is good for us
-        enemy_risk = self.trap_belief.risk(enemy_pos)
-        score += enemy_risk * self.weights['trap_risk_current'] * 0.5
-        
-        # === TURD RESOURCE MANAGEMENT ===
-        my_turds = game_board.chicken_player.get_turds_left()
-        enemy_turds = game_board.chicken_enemy.get_turds_left()
-        turd_diff = my_turds - enemy_turds
-        
-        score += turd_diff * self.weights['turd_diff']
+        score += self.w_space * (my_space - opp_space)
+
+        # 4. Visit Count Penalty (Discourage oscillation)
+        # visit_counts keys are (x, y)
+        revisit_penalty = 0.0
+        if my_pos in visit_counts:
+             revisit_penalty = visit_counts[my_pos] * self.w_revisit
+        score -= revisit_penalty
+
+        # 5. Turd Placement
+        # Bonus for turds in central lanes
+        # We can iterate over turds_player set
+        for turd_pos in game_board.turds_player:
+             # Center is 3, 4. Dist from center:
+             dist = abs(turd_pos[0] - 3.5) + abs(turd_pos[1] - 3.5)
+             if dist < 3: # Inner rings
+                 score += self.w_turds * (3 - dist)
         
         return score
     
-    def _terminal_value(self, game_board: board.Board) -> float:
+    def bfs_reachable_eggs(
+        self, 
+        board_state: board.Board, 
+        start_pos: Coord, 
+        max_moves: int, 
+        belief: TrapdoorBelief,
+        chicken,
+        is_opponent: bool
+    ) -> float:
         """
-        Evaluate terminal (game over) states.
-        
-        Returns:
-            Very large positive/negative value based on outcome
+        BFS to estimate maximum number of ADDITIONAL eggs that can be laid.
         """
-        winner = game_board.get_winner()
-        
-        if winner == enums.Result.PLAYER:
-            # We won
-            return 1000000.0
-        elif winner == enums.Result.ENEMY:
-            # We lost
-            return -1000000.0
-        else:
-            # Tie
+        # If 0 moves left, 0 eggs.
+        if max_moves <= 0:
             return 0.0
     
-    def evaluate(self, game_board: board.Board) -> float:
-        """
-        Combined evaluation using heuristic + value model.
+        queue = deque([(start_pos, 0)]) # (pos, depth)
+        visited = {start_pos}
+        reachable_egg_spots = 0
         
-        Strategy:
-        1. Always compute heuristic (fast and reliable).
-        2. Use the value model only as a small correction in mid/late-game.
-        3. Trust heuristic entirely in:
-           - Terminal states
-           - Very confident positions
-           - Early game / no eggs yet
+        # Which squares are blocked?
+        # Opponent turds block us. Our turds block us.
+        # Existing eggs block us (can't lay egg on egg).
+        # Trapdoors with high prob should be treated as blocked?
         
-        Returns:
-            Final evaluation score.
-        """
-        # Terminal states: return immediately
-        if game_board.is_game_over():
-            return self._terminal_value(game_board)
+        # We'll use a simplified check.
+        # We need to know parity.
+        parity = chicken.even_chicken
         
-        # Always compute heuristic
-        h = self.heuristic(game_board)
-        
-        # If value model not loaded, use heuristic only
-        if not self.value_model.is_loaded():
-            return h
-        
-        # Early-game gate: don't trust value net before eggs or when very early
-        my_eggs = game_board.chicken_player.get_eggs_laid()
-        enemy_eggs = game_board.chicken_enemy.get_eggs_laid()
-        total_eggs = my_eggs + enemy_eggs
-        turns_left = getattr(game_board, "turns_left_player", 40)
-        
-        if total_eggs == 0 or turns_left > 30:
-            return h
-        
-        # Use value net as a small correction in mid/late game
-        try:
-            board_tensor = encode_board_tensor(game_board, self.trap_belief)  # (14, 8, 8)
-            scalars = extract_scalar_features(game_board, self.trap_belief)    # (24,)
+        while queue:
+            curr, depth = queue.popleft()
             
-            # Concatenate into single input vector
-            x = np.concatenate([board_tensor.flatten(), scalars])
+            if depth >= max_moves:
+                continue
             
-            # Get value model prediction (in [-1, 1])
-            v = self.value_model.forward(x)
-            
-        except Exception as e:
-            # If value model fails for any reason, fall back to heuristic
-            print(f"[Evaluator] Value model error: {e}")
-            return h
-        
-        # Scale value model output much more conservatively
-        scaled_v = v * 300.0
-        
-        # Heuristic-dominant blending
-        abs_h = abs(h)
-        
-        if abs_h > 2000:
-            # Very confident heuristic: ignore value model
-            return h
-        elif abs_h > 1000:
-            # Somewhat confident: 80% heuristic, 20% value
-            alpha = 0.2
+            # Explore neighbors
+            for d in enums.Direction:
+                try:
+                    nex = enums.loc_after_direction(curr, d)
+                except ValueError:
+                    continue
+                
+                if not board_state.is_valid_cell(nex):
+                    continue
+                
+                if nex in visited:
+                    continue
+                
+                # Check blocking
+                # Opponent turds?
+                if is_opponent:
+                    if nex in board_state.turds_player: continue
+                else:
+                    if nex in board_state.turds_enemy: continue
+                
+                # Own turds?
+                if is_opponent:
+                    if nex in board_state.turds_enemy: continue
         else:
-            # Uncertain position: 65% heuristic, 35% value
-            alpha = 0.35
+                    if nex in board_state.turds_player: continue
+                
+                # Trapdoor risk?
+                prob = belief.get_prob(nex[1], nex[0])
+                if prob > 0.3: # Threshold
+                    continue
+                
+                # If we can step here, add to queue
+                visited.add(nex)
+                queue.append((nex, depth + 1))
+                
+                # Can we lay an egg here?
+                # Check parity
+                if (nex[0] + nex[1]) % 2 == parity:
+                    # Check if egg already exists
+                    if nex not in board_state.eggs_player and nex not in board_state.eggs_enemy:
+                         # Distinct spot found
+                         reachable_egg_spots += 1
         
-        return (1.0 - alpha) * h + alpha * scaled_v
-    
-    def quick_evaluate(self, game_board: board.Board) -> float:
-        """
-        Fast evaluation for move ordering (heuristic only).
-        
-        Args:
-            game_board: Board state
-            
-        Returns:
-            Quick heuristic score
-        """
-        if game_board.is_game_over():
-            return self._terminal_value(game_board)
-        
-        # Simple evaluation: egg differential + mobility
-        my_eggs = game_board.chicken_player.get_eggs_laid()
-        enemy_eggs = game_board.chicken_enemy.get_eggs_laid()
-        
-        my_moves = len(game_board.get_valid_moves(enemy=False))
-        
-        # Quick score
-        score = (my_eggs - enemy_eggs) * 1000.0
-        
-        if my_moves == 0:
-            score -= 500.0
-        else:
-            score += my_moves * 10.0
-        
-        return score
+        return float(reachable_egg_spots)
 
